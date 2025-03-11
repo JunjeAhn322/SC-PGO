@@ -1,0 +1,25 @@
+{
+  "configurations": [
+    {
+      "browse": {
+        "databaseFilename": "${default}",
+        "limitSymbolsToIncludedHeaders": false
+      },
+      "includePath": [
+        "/opt/ros/foxy/include/**",
+        "/home/raibo-con/ros2_ws/install/fast_lio_localization/include/**",
+        "/home/raibo-con/ros2_ws/install/fast_lio/include/**",
+        "/home/raibo-con/ros2_ws/install/pcl_ros/include/**",
+        "/home/raibo-con/ros2_ws/install/livox_ros_driver2/include/**",
+        "/home/raibo-con/ros2_ws/install/pcl_conversions/include/**",
+        "/usr/include/**"
+      ],
+      "name": "ROS",
+      "intelliSenseMode": "gcc-x64",
+      "compilerPath": "/usr/bin/gcc",
+      "cStandard": "gnu11",
+      "cppStandard": "c++14"
+    }
+  ],
+  "version": 4
+}
