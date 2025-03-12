@@ -20,7 +20,7 @@ def generate_launch_description():
         DeclareLaunchArgument('mapping_line_resolution', default_value='0.4', description='Mapping line resolution'),
         DeclareLaunchArgument('mapping_plane_resolution', default_value='0.8', description='Mapping plane resolution'),
         DeclareLaunchArgument('keyframe_meter_gap', default_value='0.2', description='Keyframe gap in meters'),
-        DeclareLaunchArgument('sc_dist_thres', default_value='1.0', description='Scan context distance threshold'),
+        DeclareLaunchArgument('sc_dist_thres', default_value='0.3', description='Scan context distance threshold'),
         DeclareLaunchArgument('sc_max_radius', default_value='80.0', description='Scan context max radius'),
 
         # Create the alaserPGO node with remappings and parameters
