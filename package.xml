@@ -17,6 +17,8 @@
 
   <!-- Dependencies. In ROS2, it's common to use <depend> for both build and run time -->
   <depend>geometry_msgs</depend>
+  <depend>geographic_msgs</depend>
+  <depend>geodesy</depend>
   <depend>nav_msgs</depend>
   <depend>rclcpp</depend>
   <depend>rclpy</depend>

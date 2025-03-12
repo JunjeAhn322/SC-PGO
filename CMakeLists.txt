@@ -10,6 +10,8 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclpy REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(geographic_msgs REQUIRED)
+find_package(geodesy REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
@@ -31,6 +33,8 @@ include_directories(
   ${CERES_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
   ${GTSAM_INCLUDE_DIR}
+  ${geographic_msgs_INCLUDE_DIRS}
+  ${geodesy_INCLUDE_DIRS}
 )
 
 # ascanRegistration executable
@@ -94,6 +98,7 @@ ament_target_dependencies(alaserPGO
   tf2_msgs
   image_transport
   cv_bridge
+  geodesy
 )
 target_link_libraries(alaserPGO 
   ${PCL_LIBRARIES} ${CERES_LIBRARIES} ${OpenMP_CXX_FLAGS} gtsam

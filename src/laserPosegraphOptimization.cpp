@@ -42,7 +42,7 @@
 
 #include <geodesy/utm.h>
 #include <geodesy/wgs84.h>
-#include <geographic_msgs/GeoPointStamped.h>
+#include <geographic_msgs/msg/geo_point_stamped.hpp>
 
 #include <gtsam/inference/Symbol.h>
 #include <gtsam/nonlinear/Values.h>
@@ -60,6 +60,8 @@
 
 #include "aloam_velodyne/common.h"
 #include "aloam_velodyne/tic_toc.h"
+
+#include "scancontext/Scancontext.h"
 
 using namespace gtsam;
 
@@ -130,9 +132,10 @@ bool laserCloudMapPGORedraw = true;
 
 bool useGPS = true;
 
-nav_msgs::msg::Odometry::ConstSharedPtr currGPS;
+sensor_msgs::msg::NavSatFix::ConstSharedPtr currGPS;
 bool hasGPSforThisKF = false;
 bool gpsOffsetInitialized = false; 
+int GPS_STATUS;
 double gpsAltitudeInitOffset = 0.0;
 double gpsLatitudeInitOffset = 0.0;
 double gpsLongitudeInitOffset = 0.0;
@@ -144,7 +147,7 @@ double recentOptimizedY = 0.0;
 std::shared_ptr<rclcpp::Publisher<sensor_msgs::msg::PointCloud2>> pubMapAftPGO, pubLoopScanLocal, pubLoopSubmapLocal;
 std::shared_ptr<rclcpp::Publisher<nav_msgs::msg::Odometry>>  pubOdomAftPGO, pubOdomGps, pubOdomRepubVerifier;
 std::shared_ptr<rclcpp::Publisher<nav_msgs::msg::Path>> pubPathAftPGO;
-nav_msgs::Odometry odomGps;
+nav_msgs::msg::Odometry odomGps;
 
 std::string save_directory;
 std::string pgKITTIformat, pgScansDirectory;
@@ -153,7 +156,7 @@ std::fstream pgTimeSaveStream;
 
 // GPS factor
 Eigen::Vector3d iSamInputGPS(double latitude, double longitude, double altitude){
-    geographic_msgs::GeoPointStampedPtr gps_msg(new geographic_msgs::GeoPointStamped());
+    geographic_msgs::msg::GeoPointStamped::SharedPtr gps_msg(new geographic_msgs::msg::GeoPointStamped());
     gps_msg->position.latitude = latitude;
     gps_msg->position.longitude = longitude;
     gps_msg->position.altitude = altitude;
@@ -171,8 +174,66 @@ Eigen::Vector3d iSamInputGPS(double latitude, double longitude, double altitude)
     return xyz;
 }
 
+inline void att2q(const double pitch, const double roll, const double yaw,
+    double *w, double *x, double *y, double *z)
+{
+    double roll2 = roll / 2;
+    double pitch2 = pitch / 2;
+    double yaw2 = yaw / 2;
+    double sin_roll2 = sin(roll2);
+    double sin_pitch2 = sin(pitch2);
+    double sin_yaw2 = sin(yaw2);
+    double cos_roll2 = cos(roll2);
+    double cos_pitch2 = cos(pitch2);
+    double cos_yaw2 = cos(yaw2);
+    double sp = sin_pitch2, sr = sin_roll2, sy = sin_yaw2;
+    double cp = cos_pitch2, cr = cos_roll2, cy = cos_yaw2;
+
+    *w = cp * cr * cy - sp * sr * sy;
+    *x = sp * cr * cy - cp * sr * sy;
+    *y = cp * sr * cy + sp * cr * sy;
+    *z = cp * cr * sy + sp * sr * cy;
+}
+
+inline Pose6D transform(Pose6D poseFrom,const Eigen::Quaterniond &QImu)
+{
+  Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
+  Eigen::Matrix4d T_from = Eigen::Matrix4d::Identity();
+  Eigen::Matrix3d Rwi = QImu.matrix();
+  Eigen::Vector3d twi(0.82, 0, 1.60);   //lidar ->gps外参数
+ 
+  double W = 1, X = 0, Y = 0, Z = 0;
+  Eigen::Quaterniond Qtemp;
+  // printf("poseFrom--pitch,roll,yaw= %f,%f,%f\n",poseFrom.pitch*180/M_PI,poseFrom.roll*180/M_PI,poseFrom.yaw*180/M_PI);
+  att2q(poseFrom.pitch, poseFrom.roll, poseFrom.yaw, &W,&X, &Y, &Z);
+  Qtemp.w() =W; Qtemp.x() =X;Qtemp.y() =Y;Qtemp.z() =Z;
+  Eigen::Vector3d t_from(poseFrom.x, poseFrom.y, poseFrom.z);
+  Eigen::Matrix3d r_from = Qtemp.matrix();
+
+  T.block<3, 3>(0, 0) = Rwi;
+  T.block<3, 1>(0, 3) = twi;
+  T_from.block<3, 3>(0, 0) = r_from;
+  T_from.block<3, 1>(0, 3) = t_from;
+
+  Eigen::Matrix4d T_to = T*T_from;
+  // Eigen::Matrix3d Rt = Ro * Rwi;
+  Eigen::Quaterniond Qt(T_to.block<3, 3>(0, 0));
+  double roll, pitch, yaw;
+  tf2::Matrix3x3(tf2::Quaternion(Qt.x(), Qt.y(), Qt.z(), Qt.w())).getRPY(roll, pitch, yaw);
+  Pose6D poseTo;
+  poseTo.x = T_to(0,3);
+  poseTo.y = T_to(1,3);
+  poseTo.z = T_to(2,3);
+  poseTo.roll = roll;
+  poseTo.pitch = pitch;
+  poseTo.yaw = yaw;
+  // printf("poseTo---------->pitch,roll,yaw= %f,%f,%f\n",poseTo.pitch*180/M_PI,poseTo.roll*180/M_PI,poseTo.yaw*180/M_PI);
+  return poseTo;
+
+}
+
 void imuHandler(const sensor_msgs::msg::Imu::ConstSharedPtr msg_in){
-    curr_imu = *msg_in;
+    curr_IMU = *msg_in;
     get_imu = true;
 }
 
@@ -255,6 +316,7 @@ void gpsHandler(const sensor_msgs::msg::NavSatFix::ConstSharedPtr _gps)
 {
     if(useGPS) {
         mBuf.lock();
+        GPS_STATUS = _gps->status.status;
         gpsBuf.push(_gps);
         mBuf.unlock();
     }
@@ -263,7 +325,7 @@ void gpsHandler(const sensor_msgs::msg::NavSatFix::ConstSharedPtr _gps)
 void initNoises( void )
 {
     gtsam::Vector priorNoiseVector6(6);
-    priorNoiseVector6 << 1e-12, 1e-12, 1e-12, 1e-12, 1e-12, 1e-12;
+    priorNoiseVector6 << 1e-6, 1e-6, 1e-6,1e-6, 1e-6, 1e-6;
     priorNoise = noiseModel::Diagonal::Variances(priorNoiseVector6);
 
     gtsam::Vector odomNoiseVector6(6);
@@ -572,22 +634,14 @@ void process_pg()
             pcl::fromROSMsg(*fullResBuf.front(), *thisKeyFrame);
             fullResBuf.pop();
 
-            Pose6D pose_curr_ = getOdom(odometryBuf.front());
-            if (firstLoop){
-                printf("First Loop\n");
-                Q_first.w() = curr_IMU.orientation.w;
-                Q_first.x() = curr_IMU.orientation.x;
-                Q_first.y() = curr_IMU.orientation.y;
-                Q_first.z() = curr_IMU.orientation.z;
-                firstLoop = false;
-            }
-            Pose6D pose_curr = transform(pose_curr_, Q_first);
+            Pose6D pose_curr = getOdom(odometryBuf.front());
 
             odometryBuf.pop();
 
             // find nearest gps 
             double eps = 0.1; // find a gps topioc arrived within eps second 
             while (!gpsBuf.empty()) {
+                
                 auto thisGPS = gpsBuf.front();
                 auto thisGPSTime = toSec(thisGPS->header.stamp);
                 if( abs(thisGPSTime - timeLaserOdometry) < eps ) {
@@ -692,7 +746,7 @@ void process_pg()
                         odomGps.pose.pose.position.y = gps_xyz[1];
                         odomGps.pose.pose.position.z = gps_xyz[2];
                         
-                        pubOdomGps.publish(odomGps);
+                        pubOdomGps->publish(odomGps);
 
                         mtxRecentPose.lock();
 
@@ -700,7 +754,7 @@ void process_pg()
                         gtsam::Point3 gpsConstraint(gps_xyz[0], gps_xyz[1], gps_xyz[2]);
 
                         gtsam::Vector robustNoiseVector3(3); // gps factor has 3 elements (xyz)
-                        robustNoiseVector3 << currGPS->position_covariance[0], currGPS->position_covariance[4], currGPS->position_covariance[8]; // means only caring altitude here. (because LOAM-like-methods tends to be asymptotically flyging)
+                        robustNoiseVector3 << currGPS->position_covariance[0], currGPS->position_covariance[4], currGPS->position_covariance[8] ; // means only caring altitude here. (because LOAM-like-methods tends to be asymptotically flyging)
                         robustGPSNoise = gtsam::noiseModel::Robust::Create(
                         gtsam::noiseModel::mEstimator::Cauchy::Create(1), // optional: replacing Cauchy by DCS or GemanMcClure is okay but Cauchy is empirically good.
                         gtsam::noiseModel::Diagonal::Variances(robustNoiseVector3) );
@@ -709,7 +763,10 @@ void process_pg()
                         
                         // gtSAMgraph.add(gtsam::GPSFactor(curr_node_idx, gpsConstraint, robustGPSNoise));
                         // cout << "GPS factor added at node " << curr_node_idx << endl;
-                        if(currGPS->position_covariance[0]<= 0.05 && currGPS->position_covariance[4]<= 0.05)
+                        // 
+                        // if(currGPS->position_covariance[0]<= 0.05 && currGPS->position_covariance[4]<= 0.05)
+                        cout << "GPS Status : " << GPS_STATUS << endl;
+                        if(GPS_STATUS >= 0)
                         {
                             gtSAMgraph.add(gtsam::GPSFactor(curr_node_idx, gpsConstraint, robustGPSNoise));
                             cout << "========================>GPS factor added at node " << curr_node_idx << endl;
@@ -934,9 +991,9 @@ int main(int argc, char **argv)
 	// ros::Subscriber subLaserOdometry = nh.subscribe<nav_msgs::msg::Odometry>("/aft_mapped_to_init", 100, laserOdometryHandler);
     auto subLaserOdometry = nh->create_subscription<nav_msgs::msg::Odometry>("/Odometry", 100, laserOdometryHandler);
 	// ros::Subscriber subGPS = nh.subscribe<sensor_msgs::msg::NavSatFix>("/gps/fix", 100, gpsHandler);
-    auto subGPS = nh->create_subscription<sensor_msgs::msg::NavSatFix>("/localization/gps/fix", 100, gpsHandler);
+    auto subGPS = nh->create_subscription<sensor_msgs::msg::NavSatFix>("/ublox_gps_node/fix", 100, gpsHandler);
 
-    auto subImu = nh->create_subscription<sensor_msgs::msg::Imu>("/localization/imu/data", 100, imuHandler);
+    auto subImu = nh->create_subscription<sensor_msgs::msg::Imu>("/livox/imu", 100, imuHandler);
 
 	// pubOdomAftPGO = nh.advertise<nav_msgs::msg::Odometry>("/aft_pgo_odom", 100);
     pubOdomAftPGO = nh->create_publisher<nav_msgs::msg::Odometry>("/aft_pgo_odom", 100);
