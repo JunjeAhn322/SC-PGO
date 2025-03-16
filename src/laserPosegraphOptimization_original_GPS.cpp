@@ -7,7 +7,6 @@
 #include <iostream>
 #include <string>
 #include <optional>
-#include <iomanip>
 
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -108,9 +107,6 @@ int recentIdxUpdated = 0;
 
 gtsam::NonlinearFactorGraph gtSAMgraph;
 bool gtSAMgraphMade = false;
-bool isPoseInitialized = false;
-int cnt = 0;
-int debugging_idx;
 gtsam::Values initialEstimate;
 gtsam::ISAM2 *isam;
 gtsam::Values isamCurrentEstimate;
@@ -138,19 +134,15 @@ bool useGPS = true;
 
 sensor_msgs::msg::NavSatFix::ConstSharedPtr currGPS;
 bool hasGPSforThisKF = false;
+bool gpsOffsetInitialized = false; 
 int GPS_STATUS;
+double gpsAltitudeInitOffset = 0.0;
+double gpsLatitudeInitOffset = 0.0;
+double gpsLongitudeInitOffset = 0.0;
 boost::optional<Eigen::Vector3d> zero_utm;
 Eigen::Vector3d gps_xyz;
 double recentOptimizedX = 0.0;
 double recentOptimizedY = 0.0;
-std::vector<Eigen::Vector3d> fast_lio_positions;
-std::vector<Eigen::Vector3d> utm_positions;
-Matrix3d utm_to_lio_rotation;
-Vector3d utm_to_lio_translation;
-Eigen::Affine3f lio_init_to_current;
-Vector3d prev_lio_position(0, 0, 0);
-Pose6D current_pose;
-std::vector<double> covariance_vector;
 
 std::shared_ptr<rclcpp::Publisher<sensor_msgs::msg::PointCloud2>> pubMapAftPGO, pubLoopScanLocal, pubLoopSubmapLocal;
 std::shared_ptr<rclcpp::Publisher<nav_msgs::msg::Odometry>>  pubOdomAftPGO, pubOdomGps, pubOdomRepubVerifier;
@@ -161,7 +153,7 @@ std::string save_directory;
 std::string pgKITTIformat, pgScansDirectory;
 std::string odomKITTIformat;
 std::fstream pgTimeSaveStream;
-void poseInitialize();
+
 // GPS factor
 Eigen::Vector3d iSamInputGPS(double latitude, double longitude, double altitude){
     geographic_msgs::msg::GeoPointStamped::SharedPtr gps_msg(new geographic_msgs::msg::GeoPointStamped());
@@ -241,13 +233,6 @@ inline Pose6D transform(Pose6D poseFrom,const Eigen::Quaterniond &QImu)
 }
 
 void imuHandler(const sensor_msgs::msg::Imu::ConstSharedPtr msg_in){
-    cnt ++;
-    if (!isPoseInitialized){
-        if (cnt % 10 == 0){
-            poseInitialize();
-        }
-        return;
-    }
     curr_IMU = *msg_in;
     get_imu = true;
 }
@@ -339,6 +324,10 @@ void gpsHandler(const sensor_msgs::msg::NavSatFix::ConstSharedPtr _gps)
 
 void initNoises( void )
 {
+    gtsam::Vector priorNoiseVector6(6);
+    priorNoiseVector6 << 0.1, 0.1, 0.1, 0.1, 0.1, 0.1;
+    priorNoise = noiseModel::Diagonal::Variances(priorNoiseVector6);
+
     gtsam::Vector odomNoiseVector6(6);
     // odomNoiseVector6 << 1e-4, 1e-4, 1e-4, 1e-4, 1e-4, 1e-4;
     odomNoiseVector6 << 1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-4;
@@ -384,6 +373,7 @@ Pose6D diffTransformation(const Pose6D& _p1, const Pose6D& _p2)
     Eigen::Affine3f SE3_delta; SE3_delta.matrix() = SE3_delta0;
     float dx, dy, dz, droll, dpitch, dyaw;
     pcl::getTranslationAndEulerAngles (SE3_delta, dx, dy, dz, droll, dpitch, dyaw);
+    // std::cout << "delta : " << dx << ", " << dy << ", " << dz << ", " << droll << ", " << dpitch << ", " << dyaw << std::endl;
 
     return Pose6D{double(abs(dx)), double(abs(dy)), double(abs(dz)), double(abs(droll)), double(abs(dpitch)), double(abs(dyaw))};
 } // SE3Diff
@@ -429,7 +419,6 @@ void pubPath( void )
         odomAftPGOthis.pose.pose.position.x = pose_est.x;
         odomAftPGOthis.pose.pose.position.y = pose_est.y;
         odomAftPGOthis.pose.pose.position.z = pose_est.z;
-
         tf2::Quaternion q;
         q.setRPY(pose_est.roll, pose_est.pitch, pose_est.yaw);
         // geometry_msgs::msg::Quaternion q_msg;
@@ -437,9 +426,6 @@ void pubPath( void )
         odomAftPGOthis.pose.pose.orientation = tf2::toMsg(q);
         odomAftPGO = odomAftPGOthis;
 
-        if (node_idx == recentIdxUpdated-1)
-        cout << "position after pgo. index : " << node_idx << " x : " << pose_est.x << " y : " << pose_est.y << " z : " << pose_est.z << endl;
-        
         geometry_msgs::msg::PoseStamped poseStampAftPGO;
         poseStampAftPGO.header = odomAftPGOthis.header;
         poseStampAftPGO.pose = odomAftPGOthis.pose.pose;
@@ -653,7 +639,7 @@ void process_pg()
             odometryBuf.pop();
 
             // find nearest gps 
-            double eps = 0.2; // find a gps topic arrived within eps second 
+            double eps = 0.2; // find a gps topioc arrived within eps second 
             while (!gpsBuf.empty()) {
                 
                 auto thisGPS = gpsBuf.front();
@@ -661,11 +647,13 @@ void process_pg()
                 if( abs(thisGPSTime - timeLaserOdometry) < eps ) {
                     currGPS = thisGPS;
                     hasGPSforThisKF = true;
+                    cout << "gps found" << endl;
                     break;
                 } else {
                     hasGPSforThisKF = false;
                 }
                 gpsBuf.pop();
+                std::cout<<abs(thisGPSTime - timeLaserOdometry)<<std::endl;
             }
             mBuf.unlock(); 
 
@@ -691,6 +679,16 @@ void process_pg()
             if( ! isNowKeyFrame ) 
                 continue; 
 
+            if( !gpsOffsetInitialized ) {
+                if(hasGPSforThisKF) { // if the very first frame 
+                    cout << gpsAltitudeInitOffset << " " << gpsLatitudeInitOffset << " " << gpsLongitudeInitOffset << endl;
+                    gpsAltitudeInitOffset = currGPS->altitude;
+                    gpsLatitudeInitOffset = currGPS->latitude;
+                    gpsLongitudeInitOffset = currGPS->longitude;
+                    gpsOffsetInitialized = true;
+                } 
+            }
+
             //
             // Save data and Add consecutive node 
             //
@@ -712,30 +710,14 @@ void process_pg()
             const int prev_node_idx = keyframePoses.size() - 2; 
             const int curr_node_idx = keyframePoses.size() - 1; // becuase cpp starts with 0 (actually this index could be any number, but for simple implementation, we follow sequential indexing)
             if( ! gtSAMgraphMade /* prior node */) {
-                gtsam::Vector priorNoiseVector6(6);
-                priorNoiseVector6 << 0.01, 0.01, 0.01, covariance_vector[0], covariance_vector[1], covariance_vector[2];
-                priorNoise = noiseModel::Diagonal::Variances(priorNoiseVector6);
                 const int init_node_idx = 0; 
                 // gtsam::Pose3 poseOrigin = Pose6DtoGTSAMPose3(keyframePoses.at(init_node_idx));
-
-                Eigen::AngleAxisd rollAngle(current_pose.roll, Eigen::Vector3d::UnitX());
-                Eigen::AngleAxisd pitchAngle(current_pose.pitch, Eigen::Vector3d::UnitY());
-                Eigen::AngleAxisd yawAngle(current_pose.yaw, Eigen::Vector3d::UnitZ());
-            
-                Eigen::Matrix3d utm_to_curr_rotation = utm_to_lio_rotation * yawAngle * pitchAngle * rollAngle;
-                Eigen::Vector3d utm_to_curr_translation = utm_to_lio_translation + utm_to_lio_rotation * Eigen::Vector3d(current_pose.x, current_pose.y, current_pose.z);
-
-                Eigen::Vector3d rpy = utm_to_curr_rotation.eulerAngles(0, 1, 2); // roll, pitch, yaw
-                double roll  = rpy[0];
-                double pitch = rpy[1];
-                double yaw   = rpy[2];
-                auto poseOrigin = gtsam::Pose3(gtsam::Rot3::RzRyRx(roll, pitch, yaw), gtsam::Point3(0, 0, 0));
-
-                // auto poseOrigin = gtsam::Pose3(gtsam::Rot3::RzRyRx(current_pose.roll, current_pose.pitch, current_pose.yaw), gtsam::Point3(current_pose.x, current_pose.y, current_pose.z));
+                auto poseOrigin = gtsam::Pose3(gtsam::Rot3::RzRyRx(0.0, 0.0, 0.0), gtsam::Point3(0.0, 0.0, 0.0));
 
                 mtxPosegraph.lock();
                 {
                     // prior factor 
+                    cout << "prior factor added" << endl;
                     gtSAMgraph.add(gtsam::PriorFactor<gtsam::Pose3>(init_node_idx, poseOrigin, priorNoise));
                     initialEstimate.insert(init_node_idx, poseOrigin);
                     // runISAM2opt();          
@@ -744,6 +726,7 @@ void process_pg()
 
                 gtSAMgraphMade = true; 
 
+                cout << "posegraph prior node " << init_node_idx << " added" << endl;
             } else /* consecutive node (and odom factor) after the prior added */ { // == keyframePoses.size() > 1 
                 gtsam::Pose3 poseFrom = Pose6DtoGTSAMPose3(keyframePoses.at(prev_node_idx));
                 gtsam::Pose3 poseTo = Pose6DtoGTSAMPose3(keyframePoses.at(curr_node_idx));
@@ -752,9 +735,11 @@ void process_pg()
                 {
                     // odom factor
                     gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(prev_node_idx, curr_node_idx, poseFrom.between(poseTo), odomNoise));
+                    cout << "odom factor added between node " << prev_node_idx << " and " << curr_node_idx << endl;
 
                     // gps factor 
                     if(hasGPSforThisKF) {
+                        // double curr_altitude_offseted = currGPS->altitude - gpsAltitudeInitOffset;
                         gps_xyz = iSamInputGPS(currGPS->latitude,currGPS->longitude,currGPS->altitude);
                         odomGps.header.frame_id = "camera_init";
                         odomGps.header.stamp = currGPS->header.stamp;
@@ -781,12 +766,15 @@ void process_pg()
                     
                         mtxRecentPose.unlock();
                         
+                        // gtSAMgraph.add(gtsam::GPSFactor(curr_node_idx, gpsConstraint, robustGPSNoise));
+                        // cout << "GPS factor added at node " << curr_node_idx << endl;
+                        // 
+                        // if(currGPS->position_covariance[0]<= 0.05 && currGPS->position_covariance[4]<= 0.05)
                         cout << "GPS Status : " << GPS_STATUS << endl;
                         if(GPS_STATUS >= 0)
                         {
                             gtSAMgraph.add(gtsam::GPSFactor(curr_node_idx, gpsConstraint, robustGPSNoise));
-                            cout << "GPS Factor Added at node " << curr_node_idx << "x : " << gpsConstraint.x() << " y : " << gpsConstraint.y() << " z : " << gpsConstraint.z() << endl;
-                            debugging_idx = curr_node_idx;
+                            cout << "========================>GPS factor added at node " << curr_node_idx << endl;
                         }
                     }
                     initialEstimate.insert(curr_node_idx, poseTo);                
@@ -950,127 +938,13 @@ void process_viz_map(void)
     }
 } // pointcloud_viz
 
-std::pair<Matrix3d, Vector3d> align3DPoints(const std::vector<Vector3d>& src, const std::vector<Vector3d>& dst) {
-    int N = src.size();
-    if (N != dst.size() || N == 0) {
-        throw std::runtime_error("Point sets must have the same non-zero size.");
-    }
-
-    // Compute centroids
-    Vector3d centroid_src = Vector3d::Zero();
-    Vector3d centroid_dst = Vector3d::Zero();
-    for (int i = 0; i < N; i++) {
-        centroid_src += src[i];
-        centroid_dst += dst[i];
-    }
-    centroid_src /= N;
-    centroid_dst /= N;
-
-    // Center points
-    MatrixXd centered_src(3, N), centered_dst(3, N);
-    for (int i = 0; i < N; i++) {
-        centered_src.col(i) = src[i] - centroid_src;
-        centered_dst.col(i) = dst[i] - centroid_dst;
-    }
-
-    // Compute covariance matrix
-    Matrix3d H = centered_src * centered_dst.transpose();
-
-    // Compute SVD
-    JacobiSVD<Matrix3d> svd(H, ComputeFullU | ComputeFullV);
-    Matrix3d U = svd.matrixU();
-    Matrix3d V = svd.matrixV();
-
-    // Compute rotation
-    Matrix3d R = V * U.transpose();
-
-    // Ensure a proper rotation (det(R) = 1)
-    if (R.determinant() < 0) {
-        V.col(2) *= -1;
-        R = V * U.transpose();
-    }
-
-    // Compute translation
-    Vector3d t = centroid_dst - R * centroid_src;
-
-    return {R, t};
-}
-
-void poseInitialize(){
-    // fast_lio_positions : {lat, lon, alt, roll, pitch, yaw}
-    // utm_positions : {easting, northing, alt, roll, pitch, yaw}
-    if (GPS_STATUS < 0){
-        return;
-    }
-    else if (odometryBuf.empty() || fullResBuf.empty()){
-        return;
-    }
-    else{    
-        Pose6D lio_pose;
-        Vector3d utm_position;
-        mBuf.lock();       
-        while (toSec(odometryBuf.front()->header.stamp) < toSec(fullResBuf.front()->header.stamp))
-            odometryBuf.pop();
-        if (odometryBuf.empty())
-        {
-            mBuf.unlock();
-            return;
-        }
-
-        timeLaserOdometry = toSec(odometryBuf.front()->header.stamp);
-
-        lio_pose = getOdom(odometryBuf.front());
-        Vector3d lio_position(lio_pose.x, lio_pose.y, lio_pose.z);
-
-        fullResBuf.pop();
-        odometryBuf.pop();
-
-        // find nearest gps 
-        double eps = 0.2; // find a gps topic arrived within eps second 
-        while (!gpsBuf.empty()) {
-            auto thisGPS = gpsBuf.front();
-            auto thisGPSTime = toSec(thisGPS->header.stamp);
-            if( abs(thisGPSTime - timeLaserOdometry) < eps ) {
-                currGPS = thisGPS;
-                break;
-            }
-            gpsBuf.pop();
-        }
-        mBuf.unlock(); 
-        
-        utm_position = iSamInputGPS(currGPS->latitude,currGPS->longitude,currGPS->altitude);
-
-        gpsBuf.pop();
-        double distance = sqrt(pow(prev_lio_position[0]-lio_position[0], 2) + pow(prev_lio_position[1]-lio_position[1], 2) + pow(prev_lio_position[2]-lio_position[2], 2));
-        
-        if (distance > 1){ // previous to current distance is more than 1m
-            fast_lio_positions.push_back(lio_position);
-            utm_positions.push_back(utm_position);
-            prev_lio_position = lio_position;
-        }
-        if (fast_lio_positions.size() > 3){
-            // auto [utm_to_lio_rotation, utm_to_lio_translation] = align3DPoints(fast_lio_positions, utm_positions);
-            std::pair<Eigen::Matrix3d, Eigen::Vector3d> result = align3DPoints(fast_lio_positions, utm_positions);
-            utm_to_lio_rotation = result.first;
-            utm_to_lio_translation = result.second;
-
-            current_pose = lio_pose;
-            lio_init_to_current = pcl::getTransformation(current_pose.x, current_pose.y, current_pose.z, current_pose.roll, current_pose.pitch, current_pose.yaw);
-            covariance_vector = {currGPS->position_covariance[0], currGPS->position_covariance[4], currGPS->position_covariance[8]};
-
-            isPoseInitialized = true;
-        }
-    }
-    return;
-}
 
 int main(int argc, char **argv)
 {
-    cout << std::fixed << std::setprecision(10);
     rclcpp::init(argc, argv);
     nh = rclcpp::Node::make_shared("laserPGO");
-    
-    // nh.param<std::string>("save_directory", save_directory, "/"); // pose assignment every k m move 
+
+	// nh.param<std::string>("save_directory", save_directory, "/"); // pose assignment every k m move 
     nh->declare_parameter<std::string>("save_directory", "/");
     save_directory = nh->get_parameter("save_directory").get_parameter_value().get<std::string>();
     pgKITTIformat = save_directory + "optimized_poses.txt";
@@ -1080,6 +954,7 @@ int main(int argc, char **argv)
     pgScansDirectory = "/home/raibo-con/ros2_ws/src/SC-PGO/PCD/Scans/";
     auto unused = system((std::string("exec rm -r ") + pgScansDirectory).c_str());
     unused = system((std::string("mkdir -p ") + pgScansDirectory).c_str());
+
 	// nh.param<double>("keyframe_meter_gap", keyframeMeterGap, 2.0); // pose assignment every k m move 
     nh->declare_parameter<double>("keyframe_meter_gap", 1.0);
     keyframeMeterGap = nh->get_parameter("keyframe_meter_gap").get_parameter_value().get<double>();
@@ -1087,14 +962,14 @@ int main(int argc, char **argv)
     nh->declare_parameter<double>("keyframe_deg_gap", 10.0);
     keyframeDegGap = nh->get_parameter("keyframe_deg_gap").get_parameter_value().get<double>();
     keyframeRadGap = deg2rad(keyframeDegGap);
-    
+
 	// nh.param<double>("sc_dist_thres", scDistThres, 0.2);  
     nh->declare_parameter<double>("sc_dist_thres", 1.0);
     scDistThres = nh->get_parameter("sc_dist_thres").get_parameter_value().get<double>();
     // nh.param<double>("sc_max_radius", scMaximumRadius, 80.0); // 80 is recommended for outdoor, and lower (ex, 20, 40) values are recommended for indoor 
     nh->declare_parameter<double>("sc_max_radius", 80.0);
     scMaximumRadius = nh->get_parameter("sc_max_radius").get_parameter_value().get<double>();
-    
+
     ISAM2Params parameters;
     parameters.relinearizeThreshold = 0.01;
     parameters.relinearizeSkip = 1;
@@ -1142,13 +1017,16 @@ int main(int argc, char **argv)
     pubLoopSubmapLocal = nh->create_publisher<sensor_msgs::msg::PointCloud2>("/loop_submap_local", 100);
 
     pubOdomGps = nh->create_publisher<nav_msgs::msg::Odometry>("/GpsOdom", 5);
-    std::thread posegraph_slam {process_pg}; // pose graph construction
-    std::thread lc_detection {process_lcd}; // loop closure detection 
-    std::thread icp_calculation {process_icp}; // loop constraint calculation via icp 
-    std::thread isam_update {process_isam}; // if you want to call less isam2 run (for saving redundant computations and no real-time visulization is required), uncommment this and comment all the above runisam2opt when node is added. 
-    std::thread viz_map {process_viz_map}; // visualization - map (low frequency because it is heavy)
-    std::thread viz_path {process_viz_path}; // visualization - path (high frequency)
-    
+    // std::thread posegraph_slam {process_pg}; // pose graph construction
+
+	std::thread posegraph_slam {process_pg}; // pose graph construction
+	std::thread lc_detection {process_lcd}; // loop closure detection 
+	std::thread icp_calculation {process_icp}; // loop constraint calculation via icp 
+	std::thread isam_update {process_isam}; // if you want to call less isam2 run (for saving redundant computations and no real-time visulization is required), uncommment this and comment all the above runisam2opt when node is added. 
+
+	std::thread viz_map {process_viz_map}; // visualization - map (low frequency because it is heavy)
+	std::thread viz_path {process_viz_path}; // visualization - path (high frequency)
+
  	// ros::spin_some();
     rclcpp::spin(nh);
 
